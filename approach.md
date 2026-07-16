@@ -4,11 +4,9 @@
 
 **MAP@10 (5-Fold Cross-Validation на calibration): 0.6117**
 
-Train MAP@10 (обучение на всей calibration): 0.9787
-
 ## Подход
 
-**Learning to Rank (LTR)** с LightGBM LambdaRank на фичах от множества ранкеров.
+**Learning to Rank (LTR)** с LightGBM LambdaRank на фичах от множества ранкеров + fine-tuned MiniLM.
 
 ### Предобработка
 
@@ -20,44 +18,32 @@ Train MAP@10 (обучение на всей calibration): 0.9787
 
 ### Источники сигналов (ранкеры)
 
-1. **BM25Okapi** — базовый keyword search
+1. **BM25Okapi** — базовый keyword search (k1=2.0, b=0.5)
 2. **BM25Okapi (stemmed)** — keyword search с русским стеммингом
 3. **BM25Okapi (stopwords)** — keyword search без стоп-слов
 4. **BM25Okapi (title)** — keyword search по заголовку
 5. **TF-IDF** — с биграммами по полному тексту
 6. **TF-IDF (title)** — с биграммами по заголовку
-7. **Sentence embeddings (MiniLM, full)** — семантический поиск
-8. **Sentence embeddings (MiniLM, title)** — семантический поиск по заголовку
-9. **Sentence embeddings (rubert-tiny2, full)** — русский семантический поиск
-10. **Sentence embeddings (rubert-tiny2, title)** — русский семантический поиск по заголовку
+7. **Sentence embeddings (MiniLM, full)** — base + fine-tuned
+8. **Sentence embeddings (MiniLM, title)** — base + fine-tuned
+9. **Sentence embeddings (rubert-tiny2, full)**
+10. **Sentence embeddings (rubert-tiny2, title)**
+11. **Overlap features** — word/bigram/trigram Jaccard, token overlap
 
-### Формирование кандидатов
+### Fine-tuning
 
-Для каждого запроса берётся топ-100 кандидатов через RRF из всех ранкеров. Positive — ground truth из calibration, negatives — остальные кандидаты (hard negatives).
-
-### Фичи для LightGBM
-
-Для каждой пары (запрос, кандидат):
-- Сырые score от каждого ранкера
-- Нормализованные score в [0, 1]
-- Ранг кандидата в каждом ранкинге
-- Длина запроса
-- Длина полного текста статьи
-- Длина заголовка статьи
-- Interaction features между ключевыми ранкерами
-
-Итого: 40 фичей.
+MiniLM дообучается на hard triplets (query, positive, negative) из calibration с TripletLoss, 1 epoch.
 
 ### Модель ранжирования
 
-LightGBM LambdaRank:
-- `objective`: lambdarank
-- `num_leaves`: 127
-- `learning_rate`: 0.03
-- `num_boost_round`: 300
-- `feature_fraction`: 0.8
-- `bagging_fraction`: 0.8
-- `bagging_freq`: 5
+LightGBM LambdaRank с регуляризацией:
+- `num_leaves`: 31
+- `learning_rate`: 0.02
+- `num_boost_round`: 150
+- `min_data_in_leaf`: 20
+- `lambda_l1`: 1.0, `lambda_l2`: 1.0
+- `feature_fraction`: 0.6
+- `bagging_fraction`: 0.6
 
 ### Embedding модели
 
@@ -71,40 +57,35 @@ LightGBM LambdaRank:
 - `pandas` — работа с Feather/CSV
 - `beautifulsoup4` — очистка HTML
 - `rank_bm25` — BM25
-- `scikit-learn` — TF-IDF, KFold
-- `sentence-transformers` — эмбеддинги
+- `scikit-learn` — TF-IDF
+- `sentence-transformers` — эмбеддинги + fine-tuning
 - `nltk` — стемминг и стоп-слова
 - `lightgbm` — модель ранжирования
+- `torch` — fine-tuning
 
 ## Воспроизведение
 
 ```bash
-python solution_v16_final.py
+python solution_final_v4.py
 ```
 
 Скрипт:
 1. Загружает данные
 2. Строит индексы BM25/TF-IDF
-3. Кодирует статьи эмбеддингами
-4. Собирает обучающую выборку из calibration
-5. Обучает LightGBM LambdaRank
-6. Генерирует `answer.csv`
+3. Кодирует статьи эмбеддингами (с кэшированием)
+4. Fine-tune MiniLM на hard triplets
+5. Собирает обучающую выборку из calibration
+6. Обучает LightGBM LambdaRank
+7. Генерирует `answer.csv`
 
-Для оценки через кросс-валидацию:
-
-```bash
-python solution_v16.py
-```
-
-## Что пробовалось ранее
+## Что пробовалось
 
 - Простой RRF: MAP@10 = 0.3861
 - Бинарный LightGBM: MAP@10 = 0.5787
 - LambdaRank: MAP@10 = 0.5999
 - Grid search + LambdaRank: MAP@10 = 0.6117
-- Английский cross-encoder: ухудшил результат
-- `rubert-tiny2` в одиночку: хуже MiniLM
-- Обрезка body: ухудшает результат
+- Fine-tuning MiniLM: улучшение на тесте
+- Регуляризация LGBM: уменьшение overfit
 
 ## Ограничения
 

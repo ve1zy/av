@@ -100,18 +100,10 @@ tfidf_title = TfidfVectorizer(ngram_range=(1, 2), max_df=0.95, min_df=1)
 tfidf_title_matrix = tfidf_title.fit_transform(articles["title_text"].tolist())
 
 print("Loading embeddings...")
-models = {
-    "minilm": SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2"),
-    "e5": SentenceTransformer("intfloat/multilingual-e5-base"),
-}
-
+model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
 print("Encoding articles...")
-art_embs = {}
-for name, model in models.items():
-    print(f"  {name}...")
-    full_emb = model.encode(articles["full_text"].tolist(), batch_size=64, show_progress_bar=False, normalize_embeddings=True)
-    title_emb = model.encode(articles["title_text"].tolist(), batch_size=64, show_progress_bar=False, normalize_embeddings=True)
-    art_embs[name] = (model, full_emb, title_emb)
+art_full_emb = model.encode(articles["full_text"].tolist(), batch_size=128, show_progress_bar=False, normalize_embeddings=True)
+art_title_emb = model.encode(articles["title_text"].tolist(), batch_size=128, show_progress_bar=False, normalize_embeddings=True)
 
 def get_all_scores(query):
     tokens = tokenize(query, False)
@@ -128,10 +120,9 @@ def get_all_scores(query):
         "tfidf_title": (tfidf_title_matrix @ tfidf_title.transform([query]).T).toarray().flatten(),
     }
     
-    for name, (model, full_emb, title_emb) in art_embs.items():
-        q_emb = model.encode([query], show_progress_bar=False, normalize_embeddings=True)[0]
-        scores[f"emb_{name}"] = full_emb @ q_emb
-        scores[f"emb_title_{name}"] = title_emb @ q_emb
+    q_emb = model.encode([query], show_progress_bar=False, normalize_embeddings=True)[0]
+    scores["emb_minilm"] = art_full_emb @ q_emb
+    scores["emb_title_minilm"] = art_title_emb @ q_emb
     
     return scores
 
@@ -158,12 +149,15 @@ def build_features_for_candidates(query, candidate_ids):
             base.extend([scores[key][idx], normalized[key][idx], ranks[key][idx]])
         base.extend([len(query), len(articles.iloc[idx]["full_text"]), len(articles.iloc[idx]["title_text"])])
         
-        n_score = len(sorted(scores.keys()))
-        interactions = []
-        for i in range(n_score):
-            for j in range(i+1, n_score):
-                interactions.append(base[i*3] * base[j*3])
-                interactions.append(base[i*3+1] * base[j*3+1])
+        interactions = [
+            base[0] * base[3],
+            base[6] * base[18],
+            base[18] * base[24],
+            base[1] * base[19],
+            base[2] * base[20],
+            base[6] * base[7],
+            base[18] * base[21],
+        ]
         
         doc_tokens = articles.iloc[idx]["tokens"]
         title_tokens = articles.iloc[idx]["title_tokens"]

@@ -10,8 +10,9 @@ from collections import defaultdict
 from nltk.stem import SnowballStemmer
 from nltk.corpus import stopwords
 import lightgbm as lgb
+from sklearn.model_selection import KFold
 
-DATA_DIR = "./candidate_data"
+DATA_DIR = "C:/Users/PC/Downloads/avito/candidate_data"
 stemmer = SnowballStemmer("russian")
 russian_stopwords = set(stopwords.words("russian"))
 
@@ -74,7 +75,6 @@ def rrf(rankings, weights=None, k=60):
 print("Loading data...")
 articles = pd.read_feather(f"{DATA_DIR}/articles.f")
 calibration = pd.read_feather(f"{DATA_DIR}/calibration.f")
-test = pd.read_feather(f"{DATA_DIR}/test.f")
 
 print("Cleaning HTML...")
 articles["clean_body"] = articles["body"].apply(clean_html)
@@ -109,8 +109,8 @@ print("Encoding articles...")
 art_embs = {}
 for name, model in models.items():
     print(f"  {name}...")
-    full_emb = model.encode(articles["full_text"].tolist(), batch_size=64, show_progress_bar=False, normalize_embeddings=True)
-    title_emb = model.encode(articles["title_text"].tolist(), batch_size=64, show_progress_bar=False, normalize_embeddings=True)
+    full_emb = model.encode(articles["full_text"].tolist(), batch_size=32, show_progress_bar=False, normalize_embeddings=True)
+    title_emb = model.encode(articles["title_text"].tolist(), batch_size=32, show_progress_bar=False, normalize_embeddings=True)
     art_embs[name] = (model, full_emb, title_emb)
 
 def get_all_scores(query):
@@ -193,68 +193,68 @@ def get_candidates(query, candidate_k=200):
     weights = [1.0, 1.0, 1.0, 1.0, 1.0, 0.8, 1.5, 0.8, 1.0, 0.5]
     return rrf(rankings, weights=weights, k=30)[:candidate_k]
 
-print("Building training data...")
+print("Precomputing features...")
+all_queries = calibration["query_text"].tolist()
+all_relevant = [set(map(int, x.split())) for x in calibration["ground_truth"].tolist()]
+
+all_candidates = []
 all_features = []
 all_labels = []
-groups = []
-for idx, row in calibration.iterrows():
+for idx, query in enumerate(all_queries):
     if idx % 100 == 0:
-        print(f"  {idx}/{len(calibration)}")
-    query = row["query_text"]
-    relevant = set(map(int, row["ground_truth"].split()))
+        print(f"  {idx}/{len(all_queries)}")
     candidates = get_candidates(query, candidate_k=200)
+    all_candidates.append(candidates)
     features = build_features_for_candidates(query, candidates)
-    labels = [1 if aid in relevant else 0 for aid in candidates]
     all_features.append(features)
+    labels = [1 if aid in all_relevant[idx] else 0 for aid in candidates]
     all_labels.extend(labels)
-    groups.append(len(candidates))
 
-X_train = np.vstack(all_features)
-y_train = np.array(all_labels)
-print(f"Training data: {X_train.shape}, positives: {y_train.sum()}")
+X_all = np.vstack(all_features)
+y_all = np.array(all_labels)
+print(f"Total samples: {X_all.shape[0]}, features: {X_all.shape[1]}, positives: {y_all.sum()}")
 
-print("Training LambdaRank...")
-train_set = lgb.Dataset(X_train, label=y_train, group=groups)
-params = {
-    "objective": "lambdarank",
-    "metric": "ndcg",
-    "ndcg_eval_at": [10],
-    "boosting_type": "gbdt",
-    "num_leaves": 127,
-    "learning_rate": 0.03,
-    "feature_fraction": 0.8,
-    "bagging_fraction": 0.8,
-    "bagging_freq": 5,
-    "verbose": -1,
-}
-ranker = lgb.train(params, train_set, num_boost_round=300)
-ranker.save_model("./lgbm_model.txt")
+print("\n5-Fold CV...")
+kf = KFold(n_splits=5, shuffle=True, random_state=42)
+cv_scores = []
 
-print("Validating on calibration (reference)...")
-ap_scores = []
-for idx, row in calibration.iterrows():
-    query = row["query_text"]
-    relevant = list(map(int, row["ground_truth"].split()))
-    candidates = get_candidates(query, candidate_k=200)
-    features = build_features_for_candidates(query, candidates)
-    preds = ranker.predict(features)
-    ranked_indices = np.argsort(preds)[::-1]
-    predicted = [candidates[i] for i in ranked_indices[:10]]
-    ap_scores.append(map_at_k(predicted, relevant))
-print(f"Train MAP@10: {np.mean(ap_scores):.4f}")
+for fold, (train_idx, val_idx) in enumerate(kf.split(all_queries)):
+    print(f"\nFold {fold+1}...")
+    
+    train_starts = [sum(len(all_candidates[j]) for j in range(i)) for i in range(len(all_queries))]
+    X_train = np.vstack([all_features[i] for i in train_idx])
+    y_train = np.concatenate([all_labels[train_starts[i]:train_starts[i]+len(all_candidates[i])] for i in train_idx])
+    train_groups = [len(all_candidates[i]) for i in train_idx]
+    
+    train_set = lgb.Dataset(X_train, label=y_train, group=train_groups)
+    
+    params = {
+        "objective": "lambdarank",
+        "metric": "ndcg",
+        "ndcg_eval_at": [10],
+        "boosting_type": "gbdt",
+        "num_leaves": 127,
+        "learning_rate": 0.03,
+        "feature_fraction": 0.8,
+        "bagging_fraction": 0.8,
+        "bagging_freq": 5,
+        "verbose": -1,
+    }
+    
+    ranker = lgb.train(params, train_set, num_boost_round=300)
+    
+    ap_scores = []
+    for i in val_idx:
+        candidates = all_candidates[i]
+        features = all_features[i]
+        preds = ranker.predict(features)
+        ranked_indices = np.argsort(preds)[::-1]
+        predicted = [candidates[j] for j in ranked_indices[:10]]
+        ap_scores.append(map_at_k(predicted, list(all_relevant[i])))
+    
+    fold_map = np.mean(ap_scores)
+    cv_scores.append(fold_map)
+    print(f"Fold {fold+1} MAP@10: {fold_map:.4f}")
 
-print("Generating test predictions...")
-results = []
-for idx, row in test.iterrows():
-    if idx % 100 == 0:
-        print(f"  {idx}/{len(test)}")
-    query = row["query_text"]
-    candidates = get_candidates(query, candidate_k=200)
-    features = build_features_for_candidates(query, candidates)
-    preds = ranker.predict(features)
-    ranked_indices = np.argsort(preds)[::-1]
-    predicted = [candidates[i] for i in ranked_indices[:10]]
-    results.append({"query_id": row["query_id"], "answer": " ".join(map(str, predicted))})
-
-pd.DataFrame(results).to_csv("./answer.csv", index=False)
-print("Saved answer.csv")
+print(f"\nMean CV MAP@10: {np.mean(cv_scores):.4f} (+/- {np.std(cv_scores):.4f})")
+print(f"CV scores: {[f'{s:.4f}' for s in cv_scores]}")

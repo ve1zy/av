@@ -8,36 +8,31 @@
 
 ## Подход
 
-**Learning to Rank (LTR)** с LightGBM LambdaRank на фичах от множества ранкеров.
+**Learning to Rank (LTR)** с LightGBM LambdaRank + fine-tuned MiniLM на фичах от множества ранкеров.
 
 ### Ранкеры (источники фич)
 
-- BM25 базовый
+- BM25 базовый (k1=2.0, b=0.5)
 - BM25 с русским стеммингом
 - BM25 без стоп-слов
 - BM25 по заголовку
-- TF-IDF с биграммами
-- TF-IDF по заголовку
-- Sentence embeddings (MiniLM) по полному тексту
-- Sentence embeddings (MiniLM) по заголовку
-- Sentence embeddings (rubert-tiny2) по полному тексту
-- Sentence embeddings (rubert-tiny2) по заголовку
+- TF-IDF с биграммами (full + title)
+- Sentence embeddings MiniLM (full + title) — base + fine-tuned
+- Sentence embeddings rubert-tiny2 (full + title)
+- Overlap features: word/bigram/trigram Jaccard, token overlap counts
 
 ### Модель ранжирования
 
-LightGBM LambdaRank обучается на 100 hard negatives на запрос из топа кандидатов.
+LightGBM LambdaRank с регуляризацией против overfit:
+- `num_leaves`: 31
+- `learning_rate`: 0.02
+- `num_boost_round`: 150
+- `min_data_in_leaf`: 20
+- `lambda_l1`: 1.0, `lambda_l2`: 1.0
 
-Лучшие параметры:
-- `num_leaves`: 127
-- `learning_rate`: 0.03
-- `num_boost_round`: 300
+### Fine-tuning
 
-Для каждой пары формируются фичи:
-- Сырые scores от каждого ранкера
-- Нормализованные scores
-- Ранги
-- Длины запроса и документа
-- Interaction features между ранкерами
+MiniLM дообучается на hard triplets из calibration (1 epoch, TripletLoss).
 
 ### Embedding модели
 
@@ -48,9 +43,7 @@ LightGBM LambdaRank обучается на 100 hard negatives на запрос
 
 ## Файлы
 
-- `solution_v16_final.py` — финальный скрипт (генерация answer.csv)
-- `solution_v16.py` — grid search по LightGBM параметрам
-- `solution_v14.py` — LambdaRank с CV
+- `solution_final_v4.py` — финальный скрипт
 - `answer.csv` — ответы для test.f
 - `requirements.txt` — зависимости
 - `approach.md` — подробное описание решения
@@ -59,7 +52,7 @@ LightGBM LambdaRank обучается на 100 hard negatives на запрос
 
 ```bash
 pip install -r requirements.txt
-python solution_v16_final.py
+python solution_final_v4.py
 ```
 
 ## Структура данных
@@ -69,6 +62,6 @@ python solution_v16_final.py
 - `calibration.f`
 - `test.f`
 
-## Воспроизводимость
+## Кэширование
 
-Скрипт `solution_v16_final.py` использует фиксированные параметры BM25 и LightGBM. LightGBM с bagging может давать небольшие вариации, но основной сигнал стабилен.
+Embeddings кэшируются в `cache/` для ускорения повторных запусков.

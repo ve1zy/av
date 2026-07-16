@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 import re
+from collections import Counter
 from bs4 import BeautifulSoup
 from rank_bm25 import BM25Okapi
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -8,10 +9,9 @@ from sentence_transformers import SentenceTransformer
 from collections import defaultdict
 from nltk.stem import SnowballStemmer
 from nltk.corpus import stopwords
-import json
-import time
+import lightgbm as lgb
 
-DATA_DIR = "C:/Users/PC/Downloads/avito/candidate_data"
+DATA_DIR = "./candidate_data"
 stemmer = SnowballStemmer("russian")
 russian_stopwords = set(stopwords.words("russian"))
 
@@ -41,6 +41,14 @@ def tokenize_stemmed(text, use_stopwords=False):
     if use_stopwords:
         stemmed = [t for t in stemmed if len(t) > 2]
     return stemmed
+
+def get_ngrams(tokens, n=2):
+    return set(zip(*[tokens[i:] for i in range(n)]))
+
+def jaccard(a, b):
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
 
 def map_at_k(predicted, relevant, k=10):
     relevant_set = set(relevant)
@@ -75,139 +83,179 @@ articles["full_text"] = (articles["title_text"] + " ") * 3 + articles["clean_bod
 articles["tokens"] = articles["full_text"].apply(lambda x: tokenize(x, False))
 articles["tokens_stem"] = articles["full_text"].apply(lambda x: tokenize_stemmed(x, False))
 articles["tokens_stop"] = articles["full_text"].apply(lambda x: tokenize(x, True))
+articles["title_tokens"] = articles["title_text"].apply(lambda x: tokenize(x, False))
 
 article_ids = articles["article_id"].tolist()
+id_to_idx = {aid: i for i, aid in enumerate(article_ids)}
 
-cal_queries = calibration["query_text"].tolist()
-cal_relevant = [list(map(int, x.split())) for x in calibration["ground_truth"].tolist()]
+print("Building indices...")
+bm25 = BM25Okapi(articles["tokens"].tolist(), k1=2.0, b=0.5)
+bm25_stem = BM25Okapi(articles["tokens_stem"].tolist(), k1=2.0, b=0.5)
+bm25_stop = BM25Okapi(articles["tokens_stop"].tolist(), k1=2.0, b=0.5)
+bm25_title = BM25Okapi(articles["title_tokens"].tolist(), k1=2.0, b=0.5)
 
-print("Loading embeddings...")
-encoder = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
-art_emb = encoder.encode(articles["full_text"].tolist(), batch_size=128, show_progress_bar=False, normalize_embeddings=True)
-art_title_emb = encoder.encode(articles["title_text"].tolist(), batch_size=128, show_progress_bar=False, normalize_embeddings=True)
-
-print("Grid search BM25 params + RRF weights...")
-best_map = 0
-best_config = None
-best_rankings = None
-
-# Параметры BM25
-k1_values = [1.2, 1.5, 2.0]
-b_values = [0.5, 0.75, 0.9]
-
-for k1 in k1_values:
-    for b in b_values:
-        print(f"  BM25(k1={k1}, b={b})...")
-        bm25 = BM25Okapi(articles["tokens"].tolist(), k1=k1, b=b)
-        bm25_stem = BM25Okapi(articles["tokens_stem"].tolist(), k1=k1, b=b)
-        bm25_stop = BM25Okapi(articles["tokens_stop"].tolist(), k1=k1, b=b)
-        tfidf = TfidfVectorizer(ngram_range=(1, 2), max_df=0.95, min_df=1)
-        tfidf_matrix = tfidf.fit_transform(articles["full_text"].tolist())
-        
-        def get_rankings(query, candidate_k=50):
-            tokens = tokenize(query, False)
-            tokens_st = tokenize_stemmed(query, False)
-            tokens_stop = tokenize(query, True)
-            
-            bm25_scores = bm25.get_scores(tokens)
-            bm25_st_scores = bm25_stem.get_scores(tokens_st)
-            bm25_stop_scores = bm25_stop.get_scores(tokens_stop)
-            tfidf_scores = (tfidf_matrix @ tfidf.transform([query]).T).toarray().flatten()
-            q_emb = encoder.encode([query], show_progress_bar=False, normalize_embeddings=True)[0]
-            emb_scores = art_emb @ q_emb
-            title_scores = art_title_emb @ q_emb
-            
-            def top_ids(scores):
-                return [article_ids[i] for i in np.argsort(scores)[::-1][:candidate_k]]
-            
-            return [
-                top_ids(bm25_scores),
-                top_ids(bm25_st_scores),
-                top_ids(bm25_stop_scores),
-                top_ids(tfidf_scores),
-                top_ids(emb_scores),
-                top_ids(title_scores),
-            ]
-        
-        cal_rankings = [get_rankings(q, candidate_k=50) for q in cal_queries]
-        
-        weight_options = [
-            [1.0, 1.0, 0.8, 1.0, 1.8, 1.0],
-            [1.0, 1.0, 1.0, 1.0, 1.8, 0.8],
-            [1.0, 1.0, 0.8, 1.2, 2.0, 1.0],
-            [1.0, 1.0, 0.5, 1.0, 2.2, 1.0],
-            [1.0, 0.8, 0.8, 1.0, 2.0, 1.0],
-            [1.0, 1.0, 0.8, 0.8, 2.2, 0.8],
-        ]
-        
-        for k_val in [30, 40, 60]:
-            for weights in weight_options:
-                ap_scores = []
-                for rankings, relevant in zip(cal_rankings, cal_relevant):
-                    predicted = rrf(rankings, weights=weights, k=k_val)[:10]
-                    ap_scores.append(map_at_k(predicted, relevant))
-                map_score = np.mean(ap_scores)
-                if map_score > best_map:
-                    best_map = map_score
-                    best_config = {"bm25_k1": k1, "bm25_b": b, "weights": weights, "k": k_val}
-                    best_rankings = None  # будем пересчитывать
-
-print(f"Best MAP@10 = {best_map:.4f}")
-print(f"Best config = {best_config}")
-
-with open("C:/Users/PC/Downloads/avito/config.json", "w", encoding="utf-8") as f:
-    json.dump(best_config, f)
-
-# Пересоздаём финальные индексы с лучшими параметрами
-k1_best = best_config["bm25_k1"]
-b_best = best_config["bm25_b"]
-bm25 = BM25Okapi(articles["tokens"].tolist(), k1=k1_best, b=b_best)
-bm25_stem = BM25Okapi(articles["tokens_stem"].tolist(), k1=k1_best, b=b_best)
-bm25_stop = BM25Okapi(articles["tokens_stop"].tolist(), k1=k1_best, b=b_best)
 tfidf = TfidfVectorizer(ngram_range=(1, 2), max_df=0.95, min_df=1)
 tfidf_matrix = tfidf.fit_transform(articles["full_text"].tolist())
+tfidf_title = TfidfVectorizer(ngram_range=(1, 2), max_df=0.95, min_df=1)
+tfidf_title_matrix = tfidf_title.fit_transform(articles["title_text"].tolist())
 
-weights_best = best_config["weights"]
-k_best = best_config["k"]
+print("Loading embeddings...")
+models = {
+    "minilm": SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2"),
+    "rubert": SentenceTransformer("cointegrated/rubert-tiny2"),
+    "e5": SentenceTransformer("intfloat/multilingual-e5-base"),
+}
 
-def get_rankings(query, candidate_k=50):
+print("Encoding articles...")
+art_embs = {}
+for name, model in models.items():
+    print(f"  {name}...")
+    full_emb = model.encode(articles["full_text"].tolist(), batch_size=32, show_progress_bar=False, normalize_embeddings=True)
+    title_emb = model.encode(articles["title_text"].tolist(), batch_size=32, show_progress_bar=False, normalize_embeddings=True)
+    art_embs[name] = (model, full_emb, title_emb)
+
+def get_all_scores(query):
     tokens = tokenize(query, False)
     tokens_st = tokenize_stemmed(query, False)
     tokens_stop = tokenize(query, True)
+    title_tokens = tokenize(query, False)
     
-    bm25_scores = bm25.get_scores(tokens)
-    bm25_st_scores = bm25_stem.get_scores(tokens_st)
-    bm25_stop_scores = bm25_stop.get_scores(tokens_stop)
-    tfidf_scores = (tfidf_matrix @ tfidf.transform([query]).T).toarray().flatten()
-    q_emb = encoder.encode([query], show_progress_bar=False, normalize_embeddings=True)[0]
-    emb_scores = art_emb @ q_emb
-    title_scores = art_title_emb @ q_emb
+    scores = {
+        "bm25": bm25.get_scores(tokens),
+        "bm25_stem": bm25_stem.get_scores(tokens_st),
+        "bm25_stop": bm25_stop.get_scores(tokens_stop),
+        "bm25_title": bm25_title.get_scores(title_tokens),
+        "tfidf": (tfidf_matrix @ tfidf.transform([query]).T).toarray().flatten(),
+        "tfidf_title": (tfidf_title_matrix @ tfidf_title.transform([query]).T).toarray().flatten(),
+    }
     
-    def top_ids(scores):
-        return [article_ids[i] for i in np.argsort(scores)[::-1][:candidate_k]]
+    for name, (model, full_emb, title_emb) in art_embs.items():
+        q_emb = model.encode([query], show_progress_bar=False, normalize_embeddings=True)[0]
+        scores[f"emb_{name}"] = full_emb @ q_emb
+        scores[f"emb_title_{name}"] = title_emb @ q_emb
     
-    return [
-        top_ids(bm25_scores),
-        top_ids(bm25_st_scores),
-        top_ids(bm25_stop_scores),
-        top_ids(tfidf_scores),
-        top_ids(emb_scores),
-        top_ids(title_scores),
-    ]
+    return scores
 
-def rank_query(query, top_k=10, candidate_k=50):
-    rankings = get_rankings(query, candidate_k)
-    return rrf(rankings, weights=weights_best, k=k_best)[:top_k]
+def build_features_for_candidates(query, candidate_ids):
+    scores = get_all_scores(query)
+    normalized = {}
+    ranks = {}
+    for key, s in scores.items():
+        smin, smax = s.min(), s.max()
+        normalized[key] = (s - smin) / (smax - smin) if smax > smin else np.zeros_like(s)
+        ranks[key] = np.argsort(np.argsort(-s))
+    
+    query_tokens = tokenize(query, False)
+    query_tokens_set = set(query_tokens)
+    query_bigrams = get_ngrams(query_tokens, 2)
+    query_trigrams = get_ngrams(query_tokens, 3)
+    query_stems = set(tokenize_stemmed(query, False))
+    
+    features = []
+    for aid in candidate_ids:
+        idx = id_to_idx[aid]
+        base = []
+        for key in sorted(scores.keys()):
+            base.extend([scores[key][idx], normalized[key][idx], ranks[key][idx]])
+        base.extend([len(query), len(articles.iloc[idx]["full_text"]), len(articles.iloc[idx]["title_text"])])
+        
+        n_score = len(sorted(scores.keys()))
+        interactions = []
+        for i in range(n_score):
+            for j in range(i+1, n_score):
+                interactions.append(base[i*3] * base[j*3])
+                interactions.append(base[i*3+1] * base[j*3+1])
+        
+        doc_tokens = articles.iloc[idx]["tokens"]
+        title_tokens = articles.iloc[idx]["title_tokens"]
+        doc_tokens_set = set(doc_tokens)
+        title_tokens_set = set(title_tokens)
+        doc_stems = set(articles.iloc[idx]["tokens_stem"])
+        
+        overlaps = [
+            len(query_tokens_set & doc_tokens_set),
+            len(query_tokens_set & title_tokens_set),
+            jaccard(query_tokens_set, doc_tokens_set),
+            jaccard(query_tokens_set, title_tokens_set),
+            jaccard(query_stems, doc_stems),
+            jaccard(query_bigrams, get_ngrams(doc_tokens, 2)),
+            jaccard(query_trigrams, get_ngrams(doc_tokens, 3)),
+            jaccard(query_bigrams, get_ngrams(title_tokens, 2)),
+            sum((Counter(query_tokens) & Counter(doc_tokens)).values()),
+            sum((Counter(query_tokens) & Counter(title_tokens)).values()),
+        ]
+        
+        features.append(base + interactions + overlaps)
+    return np.array(features)
 
-print("Validating final on calibration...")
-ap_scores = [map_at_k(rank_query(q, 10), rel) for q, rel in zip(cal_queries, cal_relevant)]
-print(f"Final MAP@10 = {np.mean(ap_scores):.4f}")
+def get_candidates(query, candidate_k=200):
+    scores = get_all_scores(query)
+    rankings = [[article_ids[i] for i in np.argsort(scores[key])[::-1][:candidate_k]] for key in scores.keys()]
+    weights = [1.0, 1.0, 1.0, 1.0, 1.0, 0.8, 1.5, 0.8, 0.5, 0.3, 1.0, 0.5]
+    return rrf(rankings, weights=weights, k=30)[:candidate_k]
+
+print("Building training data...")
+all_features = []
+all_labels = []
+groups = []
+for idx, row in calibration.iterrows():
+    if idx % 100 == 0:
+        print(f"  {idx}/{len(calibration)}")
+    query = row["query_text"]
+    relevant = set(map(int, row["ground_truth"].split()))
+    candidates = get_candidates(query, candidate_k=200)
+    features = build_features_for_candidates(query, candidates)
+    labels = [1 if aid in relevant else 0 for aid in candidates]
+    all_features.append(features)
+    all_labels.extend(labels)
+    groups.append(len(candidates))
+
+X_train = np.vstack(all_features)
+y_train = np.array(all_labels)
+print(f"Training data: {X_train.shape}, positives: {y_train.sum()}")
+
+print("Training LambdaRank...")
+train_set = lgb.Dataset(X_train, label=y_train, group=groups)
+params = {
+    "objective": "lambdarank",
+    "metric": "ndcg",
+    "ndcg_eval_at": [10],
+    "boosting_type": "gbdt",
+    "num_leaves": 127,
+    "learning_rate": 0.03,
+    "feature_fraction": 0.8,
+    "bagging_fraction": 0.8,
+    "bagging_freq": 5,
+    "verbose": -1,
+}
+ranker = lgb.train(params, train_set, num_boost_round=300)
+ranker.save_model("./lgbm_model.txt")
+
+print("Validating on calibration (reference)...")
+ap_scores = []
+for idx, row in calibration.iterrows():
+    query = row["query_text"]
+    relevant = list(map(int, row["ground_truth"].split()))
+    candidates = get_candidates(query, candidate_k=200)
+    features = build_features_for_candidates(query, candidates)
+    preds = ranker.predict(features)
+    ranked_indices = np.argsort(preds)[::-1]
+    predicted = [candidates[i] for i in ranked_indices[:10]]
+    ap_scores.append(map_at_k(predicted, relevant))
+print(f"Train MAP@10: {np.mean(ap_scores):.4f}")
 
 print("Generating test predictions...")
 results = []
-for _, row in test.iterrows():
-    predicted = rank_query(row["query_text"], top_k=10)
+for idx, row in test.iterrows():
+    if idx % 100 == 0:
+        print(f"  {idx}/{len(test)}")
+    query = row["query_text"]
+    candidates = get_candidates(query, candidate_k=200)
+    features = build_features_for_candidates(query, candidates)
+    preds = ranker.predict(features)
+    ranked_indices = np.argsort(preds)[::-1]
+    predicted = [candidates[i] for i in ranked_indices[:10]]
     results.append({"query_id": row["query_id"], "answer": " ".join(map(str, predicted))})
 
-pd.DataFrame(results).to_csv("C:/Users/PC/Downloads/avito/answer.csv", index=False)
+pd.DataFrame(results).to_csv("./answer.csv", index=False)
 print("Saved answer.csv")

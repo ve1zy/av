@@ -11,7 +11,7 @@ from nltk.stem import SnowballStemmer
 from nltk.corpus import stopwords
 import lightgbm as lgb
 
-DATA_DIR = "./candidate_data"
+DATA_DIR = "C:/Users/PC/Downloads/avito/candidate_data"
 stemmer = SnowballStemmer("russian")
 russian_stopwords = set(stopwords.words("russian"))
 
@@ -74,7 +74,6 @@ def rrf(rankings, weights=None, k=60):
 print("Loading data...")
 articles = pd.read_feather(f"{DATA_DIR}/articles.f")
 calibration = pd.read_feather(f"{DATA_DIR}/calibration.f")
-test = pd.read_feather(f"{DATA_DIR}/test.f")
 
 print("Cleaning HTML...")
 articles["clean_body"] = articles["body"].apply(clean_html)
@@ -102,15 +101,14 @@ tfidf_title_matrix = tfidf_title.fit_transform(articles["title_text"].tolist())
 print("Loading embeddings...")
 models = {
     "minilm": SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2"),
-    "e5": SentenceTransformer("intfloat/multilingual-e5-base"),
+    "rubert": SentenceTransformer("cointegrated/rubert-tiny2"),
 }
 
 print("Encoding articles...")
 art_embs = {}
 for name, model in models.items():
-    print(f"  {name}...")
-    full_emb = model.encode(articles["full_text"].tolist(), batch_size=64, show_progress_bar=False, normalize_embeddings=True)
-    title_emb = model.encode(articles["title_text"].tolist(), batch_size=64, show_progress_bar=False, normalize_embeddings=True)
+    full_emb = model.encode(articles["full_text"].tolist(), batch_size=128, show_progress_bar=False, normalize_embeddings=True)
+    title_emb = model.encode(articles["title_text"].tolist(), batch_size=128, show_progress_bar=False, normalize_embeddings=True)
     art_embs[name] = (model, full_emb, title_emb)
 
 def get_all_scores(query):
@@ -158,12 +156,15 @@ def build_features_for_candidates(query, candidate_ids):
             base.extend([scores[key][idx], normalized[key][idx], ranks[key][idx]])
         base.extend([len(query), len(articles.iloc[idx]["full_text"]), len(articles.iloc[idx]["title_text"])])
         
-        n_score = len(sorted(scores.keys()))
-        interactions = []
-        for i in range(n_score):
-            for j in range(i+1, n_score):
-                interactions.append(base[i*3] * base[j*3])
-                interactions.append(base[i*3+1] * base[j*3+1])
+        interactions = [
+            base[0] * base[3],
+            base[6] * base[18],
+            base[18] * base[24],
+            base[1] * base[19],
+            base[2] * base[20],
+            base[6] * base[7],
+            base[18] * base[21],
+        ]
         
         doc_tokens = articles.iloc[idx]["tokens"]
         title_tokens = articles.iloc[idx]["title_tokens"]
@@ -190,31 +191,44 @@ def build_features_for_candidates(query, candidate_ids):
 def get_candidates(query, candidate_k=200):
     scores = get_all_scores(query)
     rankings = [[article_ids[i] for i in np.argsort(scores[key])[::-1][:candidate_k]] for key in scores.keys()]
-    weights = [1.0, 1.0, 1.0, 1.0, 1.0, 0.8, 1.5, 0.8, 1.0, 0.5]
+    weights = [1.0, 1.0, 1.0, 1.0, 1.0, 0.8, 1.5, 0.8, 0.5, 0.3]
     return rrf(rankings, weights=weights, k=30)[:candidate_k]
 
-print("Building training data...")
+print("Precomputing features...")
+all_queries = calibration["query_text"].tolist()
+all_relevant = [set(map(int, x.split())) for x in calibration["ground_truth"].tolist()]
+
+all_candidates = []
 all_features = []
 all_labels = []
-groups = []
-for idx, row in calibration.iterrows():
+for idx, query in enumerate(all_queries):
     if idx % 100 == 0:
-        print(f"  {idx}/{len(calibration)}")
-    query = row["query_text"]
-    relevant = set(map(int, row["ground_truth"].split()))
+        print(f"  {idx}/{len(all_queries)}")
     candidates = get_candidates(query, candidate_k=200)
+    all_candidates.append(candidates)
     features = build_features_for_candidates(query, candidates)
-    labels = [1 if aid in relevant else 0 for aid in candidates]
     all_features.append(features)
+    labels = [1 if aid in all_relevant[idx] else 0 for aid in candidates]
     all_labels.extend(labels)
-    groups.append(len(candidates))
 
-X_train = np.vstack(all_features)
-y_train = np.array(all_labels)
+# Hold-out split: 80% train, 20% validation
+np.random.seed(42)
+indices = np.random.permutation(len(all_queries))
+train_size = int(0.8 * len(all_queries))
+train_idx = indices[:train_size]
+val_idx = indices[train_size:]
+
+print(f"\nHold-out split: train={len(train_idx)}, val={len(val_idx)}")
+
+train_starts = [sum(len(all_candidates[j]) for j in range(i)) for i in range(len(all_queries))]
+X_train = np.vstack([all_features[i] for i in train_idx])
+y_train = np.concatenate([all_labels[train_starts[i]:train_starts[i]+len(all_candidates[i])] for i in train_idx])
+train_groups = [len(all_candidates[i]) for i in train_idx]
+
 print(f"Training data: {X_train.shape}, positives: {y_train.sum()}")
 
-print("Training LambdaRank...")
-train_set = lgb.Dataset(X_train, label=y_train, group=groups)
+print("Training single LightGBM...")
+train_set = lgb.Dataset(X_train, label=y_train, group=train_groups)
 params = {
     "objective": "lambdarank",
     "metric": "ndcg",
@@ -228,33 +242,44 @@ params = {
     "verbose": -1,
 }
 ranker = lgb.train(params, train_set, num_boost_round=300)
-ranker.save_model("./lgbm_model.txt")
 
-print("Validating on calibration (reference)...")
+print("Evaluating on hold-out...")
 ap_scores = []
-for idx, row in calibration.iterrows():
-    query = row["query_text"]
-    relevant = list(map(int, row["ground_truth"].split()))
-    candidates = get_candidates(query, candidate_k=200)
-    features = build_features_for_candidates(query, candidates)
+for i in val_idx:
+    candidates = all_candidates[i]
+    features = all_features[i]
     preds = ranker.predict(features)
     ranked_indices = np.argsort(preds)[::-1]
-    predicted = [candidates[i] for i in ranked_indices[:10]]
-    ap_scores.append(map_at_k(predicted, relevant))
-print(f"Train MAP@10: {np.mean(ap_scores):.4f}")
+    predicted = [candidates[j] for j in ranked_indices[:10]]
+    ap_scores.append(map_at_k(predicted, list(all_relevant[i])))
 
-print("Generating test predictions...")
-results = []
-for idx, row in test.iterrows():
-    if idx % 100 == 0:
-        print(f"  {idx}/{len(test)}")
-    query = row["query_text"]
-    candidates = get_candidates(query, candidate_k=200)
-    features = build_features_for_candidates(query, candidates)
-    preds = ranker.predict(features)
+print(f"Hold-out MAP@10: {np.mean(ap_scores):.4f}")
+
+# Ensemble of 5 models on random 80% samples
+print("\nTraining ensemble of 5 models on random 80% samples...")
+ensemble_models = []
+for seed in range(5):
+    np.random.seed(seed)
+    indices = np.random.permutation(len(all_queries))
+    train_idx = indices[:train_size]
+    
+    X_train = np.vstack([all_features[i] for i in train_idx])
+    y_train = np.concatenate([all_labels[train_starts[i]:train_starts[i]+len(all_candidates[i])] for i in train_idx])
+    train_groups = [len(all_candidates[i]) for i in train_idx]
+    
+    train_set = lgb.Dataset(X_train, label=y_train, group=train_groups)
+    params["seed"] = seed
+    ranker = lgb.train(params, train_set, num_boost_round=300)
+    ensemble_models.append(ranker)
+
+print("Evaluating ensemble on hold-out...")
+ap_scores = []
+for i in val_idx:
+    candidates = all_candidates[i]
+    features = all_features[i]
+    preds = np.mean([m.predict(features) for m in ensemble_models], axis=0)
     ranked_indices = np.argsort(preds)[::-1]
-    predicted = [candidates[i] for i in ranked_indices[:10]]
-    results.append({"query_id": row["query_id"], "answer": " ".join(map(str, predicted))})
+    predicted = [candidates[j] for j in ranked_indices[:10]]
+    ap_scores.append(map_at_k(predicted, list(all_relevant[i])))
 
-pd.DataFrame(results).to_csv("./answer.csv", index=False)
-print("Saved answer.csv")
+print(f"Ensemble hold-out MAP@10: {np.mean(ap_scores):.4f}")

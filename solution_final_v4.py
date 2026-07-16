@@ -1,17 +1,22 @@
 import pandas as pd
 import numpy as np
 import re
+import os
 from collections import Counter
 from bs4 import BeautifulSoup
 from rank_bm25 import BM25Okapi
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, InputExample, losses
+from torch.utils.data import DataLoader
 from collections import defaultdict
 from nltk.stem import SnowballStemmer
 from nltk.corpus import stopwords
 import lightgbm as lgb
 
 DATA_DIR = "./candidate_data"
+CACHE_DIR = "./cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
+
 stemmer = SnowballStemmer("russian")
 russian_stopwords = set(stopwords.words("russian"))
 
@@ -99,21 +104,109 @@ tfidf_matrix = tfidf.fit_transform(articles["full_text"].tolist())
 tfidf_title = TfidfVectorizer(ngram_range=(1, 2), max_df=0.95, min_df=1)
 tfidf_title_matrix = tfidf_title.fit_transform(articles["title_text"].tolist())
 
-print("Loading embeddings...")
-models = {
-    "minilm": SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2"),
-    "e5": SentenceTransformer("intfloat/multilingual-e5-base"),
-}
+# Кэширование base embeddings
+base_full_cache = f"{CACHE_DIR}/base_full.npy"
+base_title_cache = f"{CACHE_DIR}/base_title.npy"
 
-print("Encoding articles...")
-art_embs = {}
-for name, model in models.items():
-    print(f"  {name}...")
-    full_emb = model.encode(articles["full_text"].tolist(), batch_size=64, show_progress_bar=False, normalize_embeddings=True)
-    title_emb = model.encode(articles["title_text"].tolist(), batch_size=64, show_progress_bar=False, normalize_embeddings=True)
-    art_embs[name] = (model, full_emb, title_emb)
+if os.path.exists(base_full_cache):
+    print("Loading cached base embeddings...")
+    base_full_emb = np.load(base_full_cache)
+    base_title_emb = np.load(base_title_cache)
+else:
+    print("Encoding base embeddings...")
+    base_model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
+    base_full_emb = base_model.encode(articles["full_text"].tolist(), batch_size=128, show_progress_bar=False, normalize_embeddings=True)
+    base_title_emb = base_model.encode(articles["title_text"].tolist(), batch_size=128, show_progress_bar=False, normalize_embeddings=True)
+    np.save(base_full_cache, base_full_emb)
+    np.save(base_title_cache, base_title_emb)
 
-def get_all_scores(query):
+# Fine-tuning MiniLM
+ft_full_cache = f"{CACHE_DIR}/ft_full.npy"
+ft_title_cache = f"{CACHE_DIR}/ft_title.npy"
+ft_query_cache = f"{CACHE_DIR}/ft_queries.npy"
+ft_test_query_cache = f"{CACHE_DIR}/ft_test_queries.npy"
+
+if os.path.exists(ft_full_cache):
+    print("Loading cached fine-tuned embeddings...")
+    ft_full_emb = np.load(ft_full_cache)
+    ft_title_emb = np.load(ft_title_cache)
+    ft_query_embs = np.load(ft_query_cache)
+    ft_test_query_embs = np.load(ft_test_query_cache)
+else:
+    print("Fine-tuning MiniLM (1 epoch)...")
+    
+    # Собираем triplets
+    train_examples = []
+    for _, row in calibration.iterrows():
+        query = row["query_text"]
+        relevant_ids = list(map(int, row["ground_truth"].split()))
+        
+        tokens = tokenize(query, False)
+        bm25_scores = bm25.get_scores(tokens)
+        top_indices = np.argsort(bm25_scores)[::-1][:30]
+        top_aids = [article_ids[i] for i in top_indices]
+        
+        for rel_aid in relevant_ids:
+            if rel_aid not in id_to_idx:
+                continue
+            rel_idx = id_to_idx[rel_aid]
+            positive_text = articles.iloc[rel_idx]["full_text"]
+            
+            negatives = [aid for aid in top_aids if aid not in relevant_ids]
+            for neg_aid in negatives[:2]:
+                neg_idx = id_to_idx[neg_aid]
+                negative_text = articles.iloc[neg_idx]["full_text"]
+                train_examples.append(InputExample(texts=[query, positive_text, negative_text]))
+    
+    print(f"Triplets: {len(train_examples)}")
+    
+    ft_model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
+    train_dataloader = DataLoader(train_examples, shuffle=True, batch_size=16)
+    train_loss = losses.TripletLoss(model=ft_model)
+    
+    ft_model.fit(
+        train_objectives=[(train_dataloader, train_loss)],
+        epochs=1,
+        warmup_steps=50,
+        show_progress_bar=False,
+    )
+    
+    print("Encoding with fine-tuned model...")
+    ft_full_emb = ft_model.encode(articles["full_text"].tolist(), batch_size=128, show_progress_bar=False, normalize_embeddings=True)
+    ft_title_emb = ft_model.encode(articles["title_text"].tolist(), batch_size=128, show_progress_bar=False, normalize_embeddings=True)
+    
+    # Batch encode all queries
+    cal_queries = calibration["query_text"].tolist()
+    test_queries = test["query_text"].tolist()
+    ft_query_embs = ft_model.encode(cal_queries, batch_size=128, show_progress_bar=False, normalize_embeddings=True)
+    ft_test_query_embs = ft_model.encode(test_queries, batch_size=128, show_progress_bar=False, normalize_embeddings=True)
+    
+    np.save(ft_full_cache, ft_full_emb)
+    np.save(ft_title_cache, ft_title_emb)
+    np.save(ft_query_cache, ft_query_embs)
+    np.save(ft_test_query_cache, ft_test_query_embs)
+
+# Batch encode base queries
+base_query_cache = f"{CACHE_DIR}/base_queries.npy"
+base_test_query_cache = f"{CACHE_DIR}/base_test_queries.npy"
+
+if os.path.exists(base_query_cache):
+    base_query_embs = np.load(base_query_cache)
+    base_test_query_embs = np.load(base_test_query_cache)
+else:
+    print("Batch encoding base queries...")
+    base_model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
+    cal_queries = calibration["query_text"].tolist()
+    test_queries = test["query_text"].tolist()
+    base_query_embs = base_model.encode(cal_queries, batch_size=128, show_progress_bar=False, normalize_embeddings=True)
+    base_test_query_embs = base_model.encode(test_queries, batch_size=128, show_progress_bar=False, normalize_embeddings=True)
+    np.save(base_query_cache, base_query_embs)
+    np.save(base_test_query_cache, base_test_query_embs)
+
+# Предвычисляем все scores для calibration и test
+print("Precomputing scores...")
+
+def compute_scores_batch(query, query_idx, is_calibration=True):
     tokens = tokenize(query, False)
     tokens_st = tokenize_stemmed(query, False)
     tokens_stop = tokenize(query, True)
@@ -128,15 +221,22 @@ def get_all_scores(query):
         "tfidf_title": (tfidf_title_matrix @ tfidf_title.transform([query]).T).toarray().flatten(),
     }
     
-    for name, (model, full_emb, title_emb) in art_embs.items():
-        q_emb = model.encode([query], show_progress_bar=False, normalize_embeddings=True)[0]
-        scores[f"emb_{name}"] = full_emb @ q_emb
-        scores[f"emb_title_{name}"] = title_emb @ q_emb
+    if is_calibration:
+        base_q = base_query_embs[query_idx]
+        ft_q = ft_query_embs[query_idx]
+    else:
+        base_q = base_test_query_embs[query_idx]
+        ft_q = ft_test_query_embs[query_idx]
+    
+    scores["emb_base"] = base_full_emb @ base_q
+    scores["emb_title_base"] = base_title_emb @ base_q
+    scores["emb_ft"] = ft_full_emb @ ft_q
+    scores["emb_title_ft"] = ft_title_emb @ ft_q
     
     return scores
 
-def build_features_for_candidates(query, candidate_ids):
-    scores = get_all_scores(query)
+def build_features(query, query_idx, candidate_ids, is_calibration=True):
+    scores = compute_scores_batch(query, query_idx, is_calibration)
     normalized = {}
     ranks = {}
     for key, s in scores.items():
@@ -187,10 +287,10 @@ def build_features_for_candidates(query, candidate_ids):
         features.append(base + interactions + overlaps)
     return np.array(features)
 
-def get_candidates(query, candidate_k=200):
-    scores = get_all_scores(query)
+def get_candidates(query, query_idx, is_calibration=True, candidate_k=200):
+    scores = compute_scores_batch(query, query_idx, is_calibration)
     rankings = [[article_ids[i] for i in np.argsort(scores[key])[::-1][:candidate_k]] for key in scores.keys()]
-    weights = [1.0, 1.0, 1.0, 1.0, 1.0, 0.8, 1.5, 0.8, 1.0, 0.5]
+    weights = [1.0, 1.0, 1.0, 1.0, 1.0, 0.8, 1.5, 0.8, 1.5, 0.5, 1.5, 0.5]
     return rrf(rankings, weights=weights, k=30)[:candidate_k]
 
 print("Building training data...")
@@ -202,8 +302,8 @@ for idx, row in calibration.iterrows():
         print(f"  {idx}/{len(calibration)}")
     query = row["query_text"]
     relevant = set(map(int, row["ground_truth"].split()))
-    candidates = get_candidates(query, candidate_k=200)
-    features = build_features_for_candidates(query, candidates)
+    candidates = get_candidates(query, idx, is_calibration=True, candidate_k=200)
+    features = build_features(query, idx, candidates, is_calibration=True)
     labels = [1 if aid in relevant else 0 for aid in candidates]
     all_features.append(features)
     all_labels.extend(labels)
@@ -220,14 +320,17 @@ params = {
     "metric": "ndcg",
     "ndcg_eval_at": [10],
     "boosting_type": "gbdt",
-    "num_leaves": 127,
-    "learning_rate": 0.03,
-    "feature_fraction": 0.8,
-    "bagging_fraction": 0.8,
+    "num_leaves": 31,
+    "learning_rate": 0.02,
+    "feature_fraction": 0.6,
+    "bagging_fraction": 0.6,
     "bagging_freq": 5,
+    "min_data_in_leaf": 20,
+    "lambda_l1": 1.0,
+    "lambda_l2": 1.0,
     "verbose": -1,
 }
-ranker = lgb.train(params, train_set, num_boost_round=300)
+ranker = lgb.train(params, train_set, num_boost_round=150)
 ranker.save_model("./lgbm_model.txt")
 
 print("Validating on calibration (reference)...")
@@ -235,8 +338,8 @@ ap_scores = []
 for idx, row in calibration.iterrows():
     query = row["query_text"]
     relevant = list(map(int, row["ground_truth"].split()))
-    candidates = get_candidates(query, candidate_k=200)
-    features = build_features_for_candidates(query, candidates)
+    candidates = get_candidates(query, idx, is_calibration=True, candidate_k=200)
+    features = build_features(query, idx, candidates, is_calibration=True)
     preds = ranker.predict(features)
     ranked_indices = np.argsort(preds)[::-1]
     predicted = [candidates[i] for i in ranked_indices[:10]]
@@ -249,8 +352,8 @@ for idx, row in test.iterrows():
     if idx % 100 == 0:
         print(f"  {idx}/{len(test)}")
     query = row["query_text"]
-    candidates = get_candidates(query, candidate_k=200)
-    features = build_features_for_candidates(query, candidates)
+    candidates = get_candidates(query, idx, is_calibration=False, candidate_k=200)
+    features = build_features(query, idx, candidates, is_calibration=False)
     preds = ranker.predict(features)
     ranked_indices = np.argsort(preds)[::-1]
     predicted = [candidates[i] for i in ranked_indices[:10]]

@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 import re
+import os
 from collections import Counter
 from bs4 import BeautifulSoup
 from rank_bm25 import BM25Okapi
@@ -12,6 +13,9 @@ from nltk.corpus import stopwords
 import lightgbm as lgb
 
 DATA_DIR = "./candidate_data"
+CACHE_DIR = "./cache2"
+os.makedirs(CACHE_DIR, exist_ok=True)
+
 stemmer = SnowballStemmer("russian")
 russian_stopwords = set(stopwords.words("russian"))
 
@@ -99,21 +103,28 @@ tfidf_matrix = tfidf.fit_transform(articles["full_text"].tolist())
 tfidf_title = TfidfVectorizer(ngram_range=(1, 2), max_df=0.95, min_df=1)
 tfidf_title_matrix = tfidf_title.fit_transform(articles["title_text"].tolist())
 
-print("Loading embeddings...")
-models = {
-    "minilm": SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2"),
-    "e5": SentenceTransformer("intfloat/multilingual-e5-base"),
-}
+# Кэширование embeddings (batch encoding - быстро)
+def get_or_encode(cache_path, texts, model_name, batch_size=128):
+    if os.path.exists(cache_path):
+        return np.load(cache_path)
+    model = SentenceTransformer(model_name)
+    emb = model.encode(texts, batch_size=batch_size, show_progress_bar=False, normalize_embeddings=True)
+    np.save(cache_path, emb)
+    return emb
 
-print("Encoding articles...")
-art_embs = {}
-for name, model in models.items():
-    print(f"  {name}...")
-    full_emb = model.encode(articles["full_text"].tolist(), batch_size=64, show_progress_bar=False, normalize_embeddings=True)
-    title_emb = model.encode(articles["title_text"].tolist(), batch_size=64, show_progress_bar=False, normalize_embeddings=True)
-    art_embs[name] = (model, full_emb, title_emb)
+print("Encoding MiniLM embeddings (cached)...")
+minilm_full = get_or_encode(f"{CACHE_DIR}/minilm_full.npy", articles["full_text"].tolist(), "paraphrase-multilingual-MiniLM-L12-v2")
+minilm_title = get_or_encode(f"{CACHE_DIR}/minilm_title.npy", articles["title_text"].tolist(), "paraphrase-multilingual-MiniLM-L12-v2")
+minilm_cal_q = get_or_encode(f"{CACHE_DIR}/minilm_cal_q.npy", calibration["query_text"].tolist(), "paraphrase-multilingual-MiniLM-L12-v2")
+minilm_test_q = get_or_encode(f"{CACHE_DIR}/minilm_test_q.npy", test["query_text"].tolist(), "paraphrase-multilingual-MiniLM-L12-v2")
 
-def get_all_scores(query):
+print("Encoding rubert-tiny2 embeddings (cached)...")
+rubert_full = get_or_encode(f"{CACHE_DIR}/rubert_full.npy", articles["full_text"].tolist(), "cointegrated/rubert-tiny2")
+rubert_title = get_or_encode(f"{CACHE_DIR}/rubert_title.npy", articles["title_text"].tolist(), "cointegrated/rubert-tiny2")
+rubert_cal_q = get_or_encode(f"{CACHE_DIR}/rubert_cal_q.npy", calibration["query_text"].tolist(), "cointegrated/rubert-tiny2")
+rubert_test_q = get_or_encode(f"{CACHE_DIR}/rubert_test_q.npy", test["query_text"].tolist(), "cointegrated/rubert-tiny2")
+
+def compute_scores(query, query_idx, is_calibration):
     tokens = tokenize(query, False)
     tokens_st = tokenize_stemmed(query, False)
     tokens_stop = tokenize(query, True)
@@ -128,15 +139,22 @@ def get_all_scores(query):
         "tfidf_title": (tfidf_title_matrix @ tfidf_title.transform([query]).T).toarray().flatten(),
     }
     
-    for name, (model, full_emb, title_emb) in art_embs.items():
-        q_emb = model.encode([query], show_progress_bar=False, normalize_embeddings=True)[0]
-        scores[f"emb_{name}"] = full_emb @ q_emb
-        scores[f"emb_title_{name}"] = title_emb @ q_emb
+    if is_calibration:
+        ml_q = minilm_cal_q[query_idx]
+        rb_q = rubert_cal_q[query_idx]
+    else:
+        ml_q = minilm_test_q[query_idx]
+        rb_q = rubert_test_q[query_idx]
+    
+    scores["emb_minilm"] = minilm_full @ ml_q
+    scores["emb_title_minilm"] = minilm_title @ ml_q
+    scores["emb_rubert"] = rubert_full @ rb_q
+    scores["emb_title_rubert"] = rubert_title @ rb_q
     
     return scores
 
-def build_features_for_candidates(query, candidate_ids):
-    scores = get_all_scores(query)
+def build_features(query, query_idx, candidate_ids, is_calibration):
+    scores = compute_scores(query, query_idx, is_calibration)
     normalized = {}
     ranks = {}
     for key, s in scores.items():
@@ -158,12 +176,15 @@ def build_features_for_candidates(query, candidate_ids):
             base.extend([scores[key][idx], normalized[key][idx], ranks[key][idx]])
         base.extend([len(query), len(articles.iloc[idx]["full_text"]), len(articles.iloc[idx]["title_text"])])
         
-        n_score = len(sorted(scores.keys()))
-        interactions = []
-        for i in range(n_score):
-            for j in range(i+1, n_score):
-                interactions.append(base[i*3] * base[j*3])
-                interactions.append(base[i*3+1] * base[j*3+1])
+        interactions = [
+            base[0] * base[3],
+            base[6] * base[18],
+            base[18] * base[24],
+            base[1] * base[19],
+            base[2] * base[20],
+            base[6] * base[7],
+            base[18] * base[21],
+        ]
         
         doc_tokens = articles.iloc[idx]["tokens"]
         title_tokens = articles.iloc[idx]["title_tokens"]
@@ -187,10 +208,10 @@ def build_features_for_candidates(query, candidate_ids):
         features.append(base + interactions + overlaps)
     return np.array(features)
 
-def get_candidates(query, candidate_k=200):
-    scores = get_all_scores(query)
+def get_candidates(query, query_idx, is_calibration, candidate_k=100):
+    scores = compute_scores(query, query_idx, is_calibration)
     rankings = [[article_ids[i] for i in np.argsort(scores[key])[::-1][:candidate_k]] for key in scores.keys()]
-    weights = [1.0, 1.0, 1.0, 1.0, 1.0, 0.8, 1.5, 0.8, 1.0, 0.5]
+    weights = [1.0, 1.0, 1.0, 1.0, 1.0, 0.8, 1.5, 0.8, 0.5, 0.3]
     return rrf(rankings, weights=weights, k=30)[:candidate_k]
 
 print("Building training data...")
@@ -202,8 +223,8 @@ for idx, row in calibration.iterrows():
         print(f"  {idx}/{len(calibration)}")
     query = row["query_text"]
     relevant = set(map(int, row["ground_truth"].split()))
-    candidates = get_candidates(query, candidate_k=200)
-    features = build_features_for_candidates(query, candidates)
+    candidates = get_candidates(query, idx, is_calibration=True, candidate_k=100)
+    features = build_features(query, idx, candidates, is_calibration=True)
     labels = [1 if aid in relevant else 0 for aid in candidates]
     all_features.append(features)
     all_labels.extend(labels)
@@ -235,8 +256,8 @@ ap_scores = []
 for idx, row in calibration.iterrows():
     query = row["query_text"]
     relevant = list(map(int, row["ground_truth"].split()))
-    candidates = get_candidates(query, candidate_k=200)
-    features = build_features_for_candidates(query, candidates)
+    candidates = get_candidates(query, idx, is_calibration=True, candidate_k=100)
+    features = build_features(query, idx, candidates, is_calibration=True)
     preds = ranker.predict(features)
     ranked_indices = np.argsort(preds)[::-1]
     predicted = [candidates[i] for i in ranked_indices[:10]]
@@ -249,8 +270,8 @@ for idx, row in test.iterrows():
     if idx % 100 == 0:
         print(f"  {idx}/{len(test)}")
     query = row["query_text"]
-    candidates = get_candidates(query, candidate_k=200)
-    features = build_features_for_candidates(query, candidates)
+    candidates = get_candidates(query, idx, is_calibration=False, candidate_k=100)
+    features = build_features(query, idx, candidates, is_calibration=False)
     preds = ranker.predict(features)
     ranked_indices = np.argsort(preds)[::-1]
     predicted = [candidates[i] for i in ranked_indices[:10]]
