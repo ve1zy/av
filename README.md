@@ -4,11 +4,11 @@
 
 ## Метрика
 
-**MAP@10 на calibration set (5-Fold CV): 0.5787**
+**MAP@10 на calibration set (5-Fold CV): 0.6117**
 
 ## Подход
 
-**Learning to Rank (LTR)** с LightGBM на фичах от множества ранкеров.
+**Learning to Rank (LTR)** с LightGBM LambdaRank на фичах от множества ранкеров.
 
 ### Ранкеры (источники фич)
 
@@ -25,13 +25,19 @@
 
 ### Модель ранжирования
 
-LightGBM обучается на парах (запрос, кандидат) с hard negatives из топ-50 кандидатов.
+LightGBM LambdaRank обучается на 100 hard negatives на запрос из топа кандидатов.
+
+Лучшие параметры:
+- `num_leaves`: 127
+- `learning_rate`: 0.03
+- `num_boost_round`: 300
 
 Для каждой пары формируются фичи:
 - Сырые scores от каждого ранкера
 - Нормализованные scores
 - Ранги
 - Длины запроса и документа
+- Interaction features между ранкерами
 
 ### Embedding модели
 
@@ -42,8 +48,9 @@ LightGBM обучается на парах (запрос, кандидат) с 
 
 ## Файлы
 
-- `solution_v13_final.py` — финальный скрипт (обучение + генерация ответа)
-- `solution_v13_cv.py` — скрипт 5-fold кросс-валидации
+- `solution_v16_final.py` — финальный скрипт (генерация answer.csv)
+- `solution_v16.py` — grid search по LightGBM параметрам
+- `solution_v14.py` — LambdaRank с CV
 - `answer.csv` — ответы для test.f
 - `requirements.txt` — зависимости
 - `approach.md` — подробное описание решения
@@ -52,7 +59,7 @@ LightGBM обучается на парах (запрос, кандидат) с 
 
 ```bash
 pip install -r requirements.txt
-python solution_v13_final.py
+python solution_v16_final.py
 ```
 
 ## Структура данных
@@ -64,4 +71,4 @@ python solution_v13_final.py
 
 ## Воспроизводимость
 
-Скрипт `solution_v13_final.py` детерминирован: фиксированные параметры BM25, фиксированный seed отсутствует, но LightGBM с bagging может давать небольшие вариации. Основной сигнал стабилен.
+Скрипт `solution_v16_final.py` использует фиксированные параметры BM25 и LightGBM. LightGBM с bagging может давать небольшие вариации, но основной сигнал стабилен.

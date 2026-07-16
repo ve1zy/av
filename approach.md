@@ -2,13 +2,13 @@
 
 ## Итоговая метрика
 
-**MAP@10 (5-Fold Cross-Validation на calibration): 0.5787**
+**MAP@10 (5-Fold Cross-Validation на calibration): 0.6117**
 
-Train MAP@10 (обучение на всей calibration): 0.9420
+Train MAP@10 (обучение на всей calibration): 0.9787
 
 ## Подход
 
-**Learning to Rank (LTR)** с LightGBM на фичах от множества ранкеров.
+**Learning to Rank (LTR)** с LightGBM LambdaRank на фичах от множества ранкеров.
 
 ### Предобработка
 
@@ -33,7 +33,7 @@ Train MAP@10 (обучение на всей calibration): 0.9420
 
 ### Формирование кандидатов
 
-Для каждого запроса берётся топ-50 кандидатов через RRF из всех ранкеров. Positive — ground truth из calibration, negatives — остальные кандидаты (hard negatives).
+Для каждого запроса берётся топ-100 кандидатов через RRF из всех ранкеров. Positive — ground truth из calibration, negatives — остальные кандидаты (hard negatives).
 
 ### Фичи для LightGBM
 
@@ -44,17 +44,20 @@ Train MAP@10 (обучение на всей calibration): 0.9420
 - Длина запроса
 - Длина полного текста статьи
 - Длина заголовка статьи
+- Interaction features между ключевыми ранкерами
 
-Итого: 33 фичи.
+Итого: 40 фичей.
 
 ### Модель ранжирования
 
-LightGBM с бинарной классификацией:
-- `objective`: binary
-- `num_leaves`: 63
-- `learning_rate`: 0.05
-- `num_boost_round`: 200
-- `scale_pos_weight` для баланса классов
+LightGBM LambdaRank:
+- `objective`: lambdarank
+- `num_leaves`: 127
+- `learning_rate`: 0.03
+- `num_boost_round`: 300
+- `feature_fraction`: 0.8
+- `bagging_fraction`: 0.8
+- `bagging_freq`: 5
 
 ### Embedding модели
 
@@ -76,7 +79,7 @@ LightGBM с бинарной классификацией:
 ## Воспроизведение
 
 ```bash
-python solution_v13_final.py
+python solution_v16_final.py
 ```
 
 Скрипт:
@@ -84,18 +87,21 @@ python solution_v13_final.py
 2. Строит индексы BM25/TF-IDF
 3. Кодирует статьи эмбеддингами
 4. Собирает обучающую выборку из calibration
-5. Обучает LightGBM ranker
+5. Обучает LightGBM LambdaRank
 6. Генерирует `answer.csv`
 
 Для оценки через кросс-валидацию:
 
 ```bash
-python solution_v13_cv.py
+python solution_v16.py
 ```
 
 ## Что пробовалось ранее
 
 - Простой RRF: MAP@10 = 0.3861
+- Бинарный LightGBM: MAP@10 = 0.5787
+- LambdaRank: MAP@10 = 0.5999
+- Grid search + LambdaRank: MAP@10 = 0.6117
 - Английский cross-encoder: ухудшил результат
 - `rubert-tiny2` в одиночку: хуже MiniLM
 - Обрезка body: ухудшает результат
