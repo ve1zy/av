@@ -4,26 +4,46 @@
 
 ## Метрика
 
-**MAP@10 на calibration set: 0.3861**
+**MAP@10 на calibration set (5-Fold CV): 0.5787**
 
 ## Подход
 
-Гибридный поиск с шестью ранкерами:
+**Learning to Rank (LTR)** с LightGBM на фичах от множества ранкеров.
+
+### Ранкеры (источники фич)
+
 - BM25 базовый
 - BM25 с русским стеммингом
 - BM25 без стоп-слов
+- BM25 по заголовку
 - TF-IDF с биграммами
-- Sentence embeddings по полному тексту
-- Sentence embeddings по заголовку
+- TF-IDF по заголовку
+- Sentence embeddings (MiniLM) по полному тексту
+- Sentence embeddings (MiniLM) по заголовку
+- Sentence embeddings (rubert-tiny2) по полному тексту
+- Sentence embeddings (rubert-tiny2) по заголовку
 
-Объединение через Reciprocal Rank Fusion (RRF).
+### Модель ранжирования
 
-Модель эмбеддингов: `paraphrase-multilingual-MiniLM-L12-v2` (локальная, ~22M параметров).
+LightGBM обучается на парах (запрос, кандидат) с hard negatives из топ-50 кандидатов.
+
+Для каждой пары формируются фичи:
+- Сырые scores от каждого ранкера
+- Нормализованные scores
+- Ранги
+- Длины запроса и документа
+
+### Embedding модели
+
+- `paraphrase-multilingual-MiniLM-L12-v2` (~22M параметров)
+- `cointegrated/rubert-tiny2` (~29M параметров)
+
+Обе модели локальные, open-source, <1B параметров.
 
 ## Файлы
 
-- `solution_final_fast.py` — быстрый финальный скрипт
-- `solution_final.py` — версия с grid search параметров
+- `solution_v13_final.py` — финальный скрипт (обучение + генерация ответа)
+- `solution_v13_cv.py` — скрипт 5-fold кросс-валидации
 - `answer.csv` — ответы для test.f
 - `requirements.txt` — зависимости
 - `approach.md` — подробное описание решения
@@ -32,7 +52,7 @@
 
 ```bash
 pip install -r requirements.txt
-python solution_final_fast.py
+python solution_v13_final.py
 ```
 
 ## Структура данных
@@ -41,3 +61,7 @@ python solution_final_fast.py
 - `articles.f`
 - `calibration.f`
 - `test.f`
+
+## Воспроизводимость
+
+Скрипт `solution_v13_final.py` детерминирован: фиксированные параметры BM25, фиксированный seed отсутствует, но LightGBM с bagging может давать небольшие вариации. Основной сигнал стабилен.

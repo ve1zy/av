@@ -2,82 +2,107 @@
 
 ## Итоговая метрика
 
-**MAP@10 на calibration set: 0.3861**
+**MAP@10 (5-Fold Cross-Validation на calibration): 0.5787**
+
+Train MAP@10 (обучение на всей calibration): 0.9420
 
 ## Подход
 
-Гибридный поиск с шестью ранкерами и объединением через Reciprocal Rank Fusion (RRF).
+**Learning to Rank (LTR)** с LightGBM на фичах от множества ранкеров.
 
 ### Предобработка
 
 1. **Очистка HTML**: BeautifulSoup удаляет теги, скрипты и стили
 2. **Усиление заголовка**: title повторяется 3 раза для увеличения веса
 3. **Токенизация**: приведение к нижнему регистру, удаление спецсимволов
-4. **Стемминг**: русский SnowballStemmer для второго BM25
-5. **Стоп-слова**: удалены для третьего BM25
+4. **Стемминг**: русский SnowballStemmer для BM25
+5. **Стоп-слова**: удалены для одного из вариантов BM25
 
-### Ранжеры
+### Источники сигналов (ранкеры)
 
 1. **BM25Okapi** — базовый keyword search
 2. **BM25Okapi (stemmed)** — keyword search с русским стеммингом
 3. **BM25Okapi (stopwords)** — keyword search без стоп-слов
-4. **TF-IDF** — с биграммами (1,2)
-5. **Sentence Transformers (full text)** — семантический поиск по `title*3 + body`
-6. **Sentence Transformers (title)** — семантический поиск по title
+4. **BM25Okapi (title)** — keyword search по заголовку
+5. **TF-IDF** — с биграммами по полному тексту
+6. **TF-IDF (title)** — с биграммами по заголовку
+7. **Sentence embeddings (MiniLM, full)** — семантический поиск
+8. **Sentence embeddings (MiniLM, title)** — семантический поиск по заголовку
+9. **Sentence embeddings (rubert-tiny2, full)** — русский семантический поиск
+10. **Sentence embeddings (rubert-tiny2, title)** — русский семантический поиск по заголовку
 
-### Модель эмбеддингов
+### Формирование кандидатов
 
-`paraphrase-multilingual-MiniLM-L12-v2` (локальная open-source модель, ~22M параметров)
+Для каждого запроса берётся топ-50 кандидатов через RRF из всех ранкеров. Positive — ground truth из calibration, negatives — остальные кандидаты (hard negatives).
 
-### Оптимизированные параметры
+### Фичи для LightGBM
 
-- **BM25**: k1=2.0, b=0.5
-- **RRF**: k=30
-- **Веса ранкеров**: [1.0, 1.0, 1.0, 1.0, 1.8, 0.8]
+Для каждой пары (запрос, кандидат):
+- Сырые score от каждого ранкера
+- Нормализованные score в [0, 1]
+- Ранг кандидата в каждом ранкинге
+- Длина запроса
+- Длина полного текста статьи
+- Длина заголовка статьи
 
-### Формула RRF
+Итого: 33 фичи.
 
-`score(doc) = sum(weight_i / (k + rank_i + 1))`
+### Модель ранжирования
+
+LightGBM с бинарной классификацией:
+- `objective`: binary
+- `num_leaves`: 63
+- `learning_rate`: 0.05
+- `num_boost_round`: 200
+- `scale_pos_weight` для баланса классов
+
+### Embedding модели
+
+- `paraphrase-multilingual-MiniLM-L12-v2` (~22M параметров)
+- `cointegrated/rubert-tiny2` (~29M параметров)
+
+Обе модели локальные, open-source, значительно меньше 1B параметров.
 
 ## Используемые библиотеки
 
 - `pandas` — работа с Feather/CSV
 - `beautifulsoup4` — очистка HTML
 - `rank_bm25` — BM25
-- `scikit-learn` — TF-IDF
+- `scikit-learn` — TF-IDF, KFold
 - `sentence-transformers` — эмбеддинги
 - `nltk` — стемминг и стоп-слова
+- `lightgbm` — модель ранжирования
 
 ## Воспроизведение
 
 ```bash
-python solution_final_fast.py
+python solution_v13_final.py
 ```
 
 Скрипт:
 1. Загружает данные
 2. Строит индексы BM25/TF-IDF
 3. Кодирует статьи эмбеддингами
-4. Валидирует на calibration set
-5. Генерирует `answer.csv`
+4. Собирает обучающую выборку из calibration
+5. Обучает LightGBM ranker
+6. Генерирует `answer.csv`
 
-Также доступен `solution_final.py` — версия с grid search для подбора параметров.
-
-Для установки зависимостей:
+Для оценки через кросс-валидацию:
 
 ```bash
-pip install -r requirements.txt
+python solution_v13_cv.py
 ```
 
-## Что пробовалось и не помогло
+## Что пробовалось ранее
 
-- Английский cross-encoder — резко ухудшил метрику (не для русского)
-- Русская `rubert-tiny2` — хуже MiniLM
-- Обрезка body — ухудшает результат
-- Множественные embedding модели — слишком медленно, природа небольшая
+- Простой RRF: MAP@10 = 0.3861
+- Английский cross-encoder: ухудшил результат
+- `rubert-tiny2` в одиночку: хуже MiniLM
+- Обрезка body: ухудшает результат
 
 ## Ограничения
 
 - Все модели запускаются локально
 - Без внешних API и LLM >1B параметров
 - Без ручной разметки тестовых данных
+- Calibration используется только для обучения/валидации, не test
