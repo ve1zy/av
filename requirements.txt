@@ -1,0 +1,8 @@
+pandas
+numpy
+beautifulsoup4
+rank-bm25
+scikit-learn
+sentence-transformers
+nltk
+pyarrow
